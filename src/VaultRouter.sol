@@ -3,12 +3,10 @@ pragma solidity ^0.8.26;
 
 import {BaseHook} from "@openzeppelin/uniswap-hooks/src/base/BaseHook.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
-import {IPoolManager, SwapParams, ModifyLiquidityParams} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
+import {IPoolManager, SwapParams} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
@@ -17,7 +15,6 @@ import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol
 
 contract VaultRouter is BaseHook, Ownable {
     using PoolIdLibrary for PoolKey;
-    using SafeERC20 for IERC20;
     using CurrencyLibrary for Currency;
 
     // ---------------------------------------------------------------
@@ -339,11 +336,8 @@ contract VaultRouter is BaseHook, Ownable {
         }
     }
 
-    function _getRoundRobinVault(PoolId poolId, address[] memory vaults) internal returns (address) {
-        uint256 index = roundRobinIndex[poolId] % vaults.length;
-        roundRobinIndex[poolId]++;
-        return vaults[index];
-    }
+    // Note: round-robin advancing helper intentionally omitted as current
+    // implementation returns the view-only selection in getOptimalVault.
 
     // ---------------------------------------------------------------
     // HOOK IMPLEMENTATIONS
