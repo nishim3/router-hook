@@ -3,6 +3,7 @@ pragma solidity ^0.8.26;
 
 import {BaseHook} from "@openzeppelin/uniswap-hooks/src/base/BaseHook.sol";
 import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
@@ -26,6 +27,43 @@ contract VaultRouter is BaseHook, Ownable {
     event VaultPriorityUpdated(address indexed vault, uint256 newPriority);
     event FundsRouted(address indexed fromVault, address indexed toVault, uint256 amount);
     event RoutingStrategyUpdated(PoolId indexed poolId, RoutingStrategy strategy);
+    event VaultDeposited(address indexed vault, address indexed asset, uint256 assets, uint256 shares);
+
+    /**
+     * @notice Deposit all held balance of an asset into a selected vault and send shares to a receiver.
+     * @param poolId Pool used to resolve optimal vault when forcedVault is zero
+     * @param asset ERC20 asset address to deposit
+     * @param receiver Address that will receive the ERC4626 shares
+     * @param minShares Minimum acceptable shares minted for slippage safety
+     * @param forcedVault Optional explicit vault to use (must be active and match asset). If zero, uses strategy
+     */
+    function depositHeldToVault(
+        PoolId poolId,
+        address asset,
+        address receiver,
+        uint256 minShares,
+        address forcedVault
+    ) external onlyOwner returns (address vault, uint256 assets, uint256 shares) {
+        require(asset != address(0), "Invalid asset");
+        assets = IERC20(asset).balanceOf(address(this));
+        require(assets > 0, "No assets to deposit");
+
+        if (forcedVault != address(0)) {
+            require(vaultInfo[forcedVault].isActive, "Vault not active");
+            require(vaultInfo[forcedVault].asset == asset, "Vault asset mismatch");
+            vault = forcedVault;
+        } else {
+            vault = getOptimalVault(poolId, asset, assets);
+        }
+
+        IERC20(asset).approve(vault, assets);
+        shares = IERC4626(vault).deposit(assets, receiver);
+        require(shares >= minShares, "minShares");
+
+        vaultInfo[vault].totalRouted += assets;
+        emit FundsRouted(address(0), vault, assets);
+        emit VaultDeposited(vault, asset, assets, shares);
+    }
 
     // ---------------------------------------------------------------
     // ENUMS & STRUCTS
@@ -46,6 +84,8 @@ contract VaultRouter is BaseHook, Ownable {
         uint256 riskScore;     // 1-100, lower is safer
         bool isActive;
         uint256 totalRouted;   // Track total amount routed to this vault
+        uint256 allVaultsIndex; // Index in the allVaults array
+        uint256 assetVaultsIndex; // Index in the assetToVaults array
     }
 
     // ---------------------------------------------------------------
@@ -115,7 +155,9 @@ contract VaultRouter is BaseHook, Ownable {
             priority: priority,
             riskScore: riskScore,
             isActive: true,
-            totalRouted: 0
+            totalRouted: 0,
+            allVaultsIndex: allVaults.length,
+            assetVaultsIndex: assetToVaults[asset].length
         });
 
         allVaults.push(vault);
@@ -133,25 +175,25 @@ contract VaultRouter is BaseHook, Ownable {
         
         vaultInfo[vault].isActive = false;
         
-        // Remove from allVaults array
-        for (uint256 i = 0; i < allVaults.length; i++) {
-            if (allVaults[i] == vault) {
-                allVaults[i] = allVaults[allVaults.length - 1];
-                allVaults.pop();
-                break;
-            }
+        // O(1) removal for allVaults
+        uint256 vaultIndex = vaultInfo[vault].allVaultsIndex;
+        address lastVault = allVaults[allVaults.length - 1];
+        if (lastVault != vault) {
+            allVaults[vaultIndex] = lastVault;
+            vaultInfo[lastVault].allVaultsIndex = vaultIndex;
         }
+        allVaults.pop();
 
-        // Remove from asset mapping
+        // O(1) removal for assetToVaults
         address asset = vaultInfo[vault].asset;
         address[] storage assetVaults = assetToVaults[asset];
-        for (uint256 i = 0; i < assetVaults.length; i++) {
-            if (assetVaults[i] == vault) {
-                assetVaults[i] = assetVaults[assetVaults.length - 1];
-                assetVaults.pop();
-                break;
-            }
+        uint256 assetVaultIndex = vaultInfo[vault].assetVaultsIndex;
+        address lastAssetVault = assetVaults[assetVaults.length - 1];
+        if (lastAssetVault != vault) {
+            assetVaults[assetVaultIndex] = lastAssetVault;
+            vaultInfo[lastAssetVault].assetVaultsIndex = assetVaultIndex;
         }
+        assetVaults.pop();
 
         emit VaultRemoved(vault);
     }
@@ -272,7 +314,8 @@ contract VaultRouter is BaseHook, Ownable {
         bestVault = vaults[0];
         
         for (uint256 i = 0; i < vaults.length; i++) {
-            // Simple yield approximation: totalAssets / totalSupply ratio
+            // Note: This is a simple yield approximation based on the vault's current "share price"
+            // (total assets per share). It reflects past performance and is not a forward-looking APY.
             IERC4626 vault = IERC4626(vaults[i]);
             uint256 totalAssets = vault.totalAssets();
             uint256 totalSupply = vault.totalSupply();
@@ -336,8 +379,12 @@ contract VaultRouter is BaseHook, Ownable {
         }
     }
 
-    // Note: round-robin advancing helper intentionally omitted as current
-    // implementation returns the view-only selection in getOptimalVault.
+    function _getNextRoundRobinVault(PoolId poolId, address[] memory vaults) internal returns (address) {
+        require(vaults.length > 0, "No vaults for round robin");
+        uint256 index = roundRobinIndex[poolId] % vaults.length;
+        roundRobinIndex[poolId] = (index + 1) % vaults.length;
+        return vaults[index];
+    }
 
     // ---------------------------------------------------------------
     // HOOK IMPLEMENTATIONS
@@ -356,7 +403,7 @@ contract VaultRouter is BaseHook, Ownable {
         return BaseHook.beforeInitialize.selector;
     }
 
-    function _beforeSwap(address /* sender */, PoolKey calldata key, SwapParams calldata params, bytes calldata hookData)
+    function _beforeSwap(address /* sender */, PoolKey calldata key, SwapParams calldata /* params */, bytes calldata /* hookData */)
         internal
         override
         returns (bytes4, BeforeSwapDelta, uint24)
@@ -364,54 +411,67 @@ contract VaultRouter is BaseHook, Ownable {
         PoolId poolId = key.toId();
         totalSwapsProcessed[poolId]++;
         
-        // Extract routing information from hookData if provided
-        if (hookData.length > 0) {
-            // Custom routing logic can be implemented here
-            // For now, we'll use the default strategy
-        }
-        
-        // Determine which currency is being swapped out
-        Currency currencyIn = params.zeroForOne ? key.currency0 : key.currency1;
-        address assetIn = Currency.unwrap(currencyIn);
-        
-        if (assetIn != address(0)) { // Skip native ETH for now
-            // Find optimal vault for the incoming asset
-            address optimalVault = getOptimalVault(poolId, assetIn, uint256(int256(params.amountSpecified > 0 ? params.amountSpecified : -params.amountSpecified)));
-            
-            if (optimalVault != address(0)) {
-                // We could implement vault deposit logic here
-                // For now, just track the routing decision
-                vaultUtilization[optimalVault]++;
-            }
-        }
+        // Vault selection logic is moved to afterSwap to save gas,
+        // as the decision is only acted upon after the swap completes.
         
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function _afterSwap(address /* sender */, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata /* hookData */)
+    function _afterSwap(address /* sender */, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata hookData)
         internal
         override
         returns (bytes4, int128)
     {
         PoolId poolId = key.toId();
         
-        // Determine which currency was swapped in (input currency)
-        Currency currencyIn = params.zeroForOne ? key.currency0 : key.currency1;
-        address assetIn = Currency.unwrap(currencyIn);
+        // Decode optional routing parameters: (shareReceiver, forcedVault, minShares)
+        address shareReceiver = address(this);
+        address forcedVault = address(0);
+        uint256 minShares = 0;
+        if (hookData.length == 96) {
+            (shareReceiver, forcedVault, minShares) = abi.decode(hookData, (address, address, uint256));
+        }
+
+        // Determine output asset (the token received by the swap receiver)
+        Currency currencyOut = params.zeroForOne ? key.currency1 : key.currency0;
+        address assetOut = Currency.unwrap(currencyOut);
         
-        if (assetIn != address(0)) { // Skip native ETH for now
-            // Get the amount that was swapped in
-            uint256 amountIn = uint256(int256(params.zeroForOne ? -delta.amount0() : -delta.amount1()));
-            
-            // Find optimal vault for the input asset
-            address optimalVault = getOptimalVault(poolId, assetIn, amountIn);
-            
-            if (optimalVault != address(0)) {
-                // Update vault tracking
-                vaultInfo[optimalVault].totalRouted += amountIn;
-                
-                // Emit routing event
-                emit FundsRouted(address(0), optimalVault, amountIn);
+        if (assetOut != address(0)) { // Skip native ETH for now
+            // Amount out reflected as positive amount on the out leg of delta
+            uint256 amountOut = uint256(int256(params.zeroForOne ? delta.amount1() : delta.amount0()));
+            if (amountOut > 0) {
+                // Use forced vault if provided, else select optimal if any available
+                address selectedVault = forcedVault;
+                if (selectedVault == address(0)) {
+                    RoutingStrategy strategy = poolRoutingStrategy[poolId];
+                    address[] memory availableVaults = getAvailableVaults(poolId, assetOut);
+                    if (availableVaults.length > 0) {
+                        if (strategy == RoutingStrategy.ROUND_ROBIN) {
+                            selectedVault = _getNextRoundRobinVault(poolId, availableVaults);
+                        } else {
+                            selectedVault = getOptimalVault(poolId, assetOut, amountOut);
+                        }
+                    }
+                } else {
+                    require(vaultInfo[selectedVault].isActive, "Vault not active");
+                    require(vaultInfo[selectedVault].asset == assetOut, "Vault asset mismatch");
+                }
+
+                if (selectedVault != address(0)) {
+                    vaultUtilization[selectedVault]++;
+                    // Best-effort deposit using tokens held by this hook (works when receiver is this hook)
+                    uint256 balance = IERC20(assetOut).balanceOf(address(this));
+                    uint256 depositAssets = balance < amountOut ? balance : amountOut;
+                    if (depositAssets > 0) {
+                        IERC20(assetOut).approve(selectedVault, depositAssets);
+                        uint256 shares = IERC4626(selectedVault).deposit(depositAssets, shareReceiver);
+                        require(shares >= minShares, "minShares");
+                        emit VaultDeposited(selectedVault, assetOut, depositAssets, shares);
+                    }
+                    // Track routing decision on the intended amountOut
+                    vaultInfo[selectedVault].totalRouted += amountOut;
+                    emit FundsRouted(address(0), selectedVault, amountOut);
+                }
             }
         }
         

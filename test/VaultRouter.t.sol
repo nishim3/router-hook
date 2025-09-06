@@ -166,6 +166,14 @@ contract VaultRouterTest is Test, Deployers {
         assertEq(info.riskScore, 50);
         assertTrue(info.isActive);
         assertEq(info.totalRouted, 0);
+        assertEq(info.allVaultsIndex, 0);
+        assertEq(info.assetVaultsIndex, 0);
+
+        // Add another vault to see indices increment
+        hook.addVault(address(vault2), 100, 50);
+        info = hook.getVaultInfo(address(vault2));
+        assertEq(info.allVaultsIndex, 1);
+        assertEq(info.assetVaultsIndex, 1);
     }
 
     function testAddVaultOnlyOwner() public {
@@ -204,6 +212,29 @@ contract VaultRouterTest is Test, Deployers {
         
         VaultRouter.VaultInfo memory info = hook.getVaultInfo(address(vault1));
         assertFalse(info.isActive);
+    }
+
+    function testRemoveVaultUpdatesIndices() public {
+        hook.addVault(address(vault1), 100, 50);
+        hook.addVault(address(vault2), 100, 30);
+        hook.addVault(address(vault3), 100, 70);
+
+        // Remove the middle vault (vault2)
+        hook.removeVault(address(vault2));
+
+        // vault3 should have been moved to vault2's old spot
+        VaultRouter.VaultInfo memory info3 = hook.getVaultInfo(address(vault3));
+        assertEq(info3.allVaultsIndex, 1, "allVaultsIndex should be updated");
+        assertEq(info3.assetVaultsIndex, 1, "assetVaultsIndex should be updated");
+
+        // Check array lengths
+        address[] memory allVaults = hook.getAllActiveVaults();
+        assertEq(allVaults.length, 2, "Should be 2 active vaults");
+
+        address[] memory assetVaults = hook.getVaultsForAsset(address(token0));
+        assertEq(assetVaults.length, 2, "Should be 2 asset vaults");
+        assertEq(assetVaults[0], address(vault1));
+        assertEq(assetVaults[1], address(vault3)); // vault3 moved here
     }
 
     function testRemoveVaultNotActive() public {
@@ -307,7 +338,7 @@ contract VaultRouterTest is Test, Deployers {
         assertEq(optimal, address(vault2)); // Should select vault2 with highest priority
     }
 
-    function testGetOptimalVaultRoundRobin() public {
+    function testGetOptimalVaultRoundRobin_view() public {
         hook.addVault(address(vault1), 100, 50);
         hook.addVault(address(vault2), 100, 30);
         hook.addVault(address(vault3), 100, 70);
@@ -323,6 +354,54 @@ contract VaultRouterTest is Test, Deployers {
         // First call should return first vault (index 0)
         address optimal1 = hook.getOptimalVault(poolId, address(token0), 1e18);
         assertEq(optimal1, address(vault1));
+    }
+
+    function testRoundRobinAfterSwapAdvancesIndex() public {
+        hook.addVault(address(vault1), 100, 50);
+        hook.addVault(address(vault2), 100, 30);
+        hook.addVault(address(vault3), 100, 70);
+
+        address[] memory vaults = new address[](3);
+        vaults[0] = address(vault1);
+        vaults[1] = address(vault2);
+        vaults[2] = address(vault3);
+        
+        hook.addVaultsToPool(poolId, vaults);
+        hook.setPoolRoutingStrategy(poolId, VaultRouter.RoutingStrategy.ROUND_ROBIN);
+
+        // This hookData forces vault selection and deposit in afterSwap
+        bytes memory hookData = abi.encode(address(this), address(0), uint256(0));
+
+        // Swap 1: Should use vault1
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 1e17, amountOutMin: 0, zeroForOne: false, poolKey: poolKey,
+            hookData: hookData, receiver: address(hook), deadline: block.timestamp + 1
+        });
+        assertEq(hook.vaultUtilization(address(vault1)), 1);
+        assertEq(hook.vaultUtilization(address(vault2)), 0);
+
+        // Swap 2: Should use vault2
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 1e17, amountOutMin: 0, zeroForOne: false, poolKey: poolKey,
+            hookData: hookData, receiver: address(hook), deadline: block.timestamp + 1
+        });
+        assertEq(hook.vaultUtilization(address(vault1)), 1);
+        assertEq(hook.vaultUtilization(address(vault2)), 1);
+        assertEq(hook.vaultUtilization(address(vault3)), 0);
+
+        // Swap 3: Should use vault3
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 1e17, amountOutMin: 0, zeroForOne: false, poolKey: poolKey,
+            hookData: hookData, receiver: address(hook), deadline: block.timestamp + 1
+        });
+        assertEq(hook.vaultUtilization(address(vault3)), 1);
+
+        // Swap 4: Should wrap around to vault1
+        swapRouter.swapExactTokensForTokens({
+            amountIn: 1e17, amountOutMin: 0, zeroForOne: false, poolKey: poolKey,
+            hookData: hookData, receiver: address(hook), deadline: block.timestamp + 1
+        });
+        assertEq(hook.vaultUtilization(address(vault1)), 2);
     }
 
     function testGetAvailableVaults() public {
@@ -350,15 +429,19 @@ contract VaultRouterTest is Test, Deployers {
         hook.addVaultsToPool(poolId, vaults);
         
         uint256 amountIn = 1e18;
+
+        // The receiver of the swap must be the hook for it to deposit the assets.
+        // We can pass this contract's address in the hookData to receive the shares.
+        bytes memory hookData = abi.encode(address(this), address(0), uint256(0));
         
         // Perform swap
         swapRouter.swapExactTokensForTokens({
             amountIn: amountIn,
             amountOutMin: 0,
-            zeroForOne: true,
+            zeroForOne: false, // Changed to false to output token0, which has a vault
             poolKey: poolKey,
-            hookData: Constants.ZERO_BYTES,
-            receiver: address(this),
+            hookData: hookData,
+            receiver: address(hook),
             deadline: block.timestamp + 1
         });
         
@@ -471,5 +554,134 @@ contract VaultRouterTest is Test, Deployers {
         
         vm.expectRevert("Vault not active");
         hook.addVaultsToPool(poolId, vaults);
+    }
+
+    function testTwoStepRouteWithReceiverHook() public {
+        // Add vault and allow routing
+        hook.addVault(address(vault1), 100, 50);
+        address[] memory vaults = new address[](1);
+        vaults[0] = address(vault1);
+        hook.addVaultsToPool(poolId, vaults);
+
+        // Also add a token1 vault to avoid beforeSwap reverting due to no available vaults for assetIn (token1)
+        MockVault vaultToken1 = new MockVault(IERC20(address(token1)), "VaultT1", "VT1", 0);
+        hook.addVault(address(vaultToken1), 1, 50);
+        address[] memory vaultsT1 = new address[](1);
+        vaultsT1[0] = address(vaultToken1);
+        hook.addVaultsToPool(poolId, vaultsT1);
+
+        uint256 amountIn = 1e18;
+
+        // Swap token1 -> token0 and deliver token0 to the hook (receiver)
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: poolKey,
+            hookData: Constants.ZERO_BYTES,
+            receiver: address(hook),
+            deadline: block.timestamp + 1
+        });
+
+        // Deposit the held token0 from the hook into the optimal vault; shares to this test contract
+        uint256 assetsBefore = vault1.totalAssets();
+        (address usedVault, uint256 assets, uint256 shares) = hook.depositHeldToVault(
+            poolId,
+            address(token0),
+            address(this),
+            0,
+            address(0)
+        );
+        assertEq(usedVault, address(vault1));
+        assertGt(assets, 0);
+        assertLe(assets, amountIn);
+        assertGt(shares, 0);
+
+        // Mock vault reports totalAssets with +5% yield
+        uint256 assetsAfter = vault1.totalAssets();
+        assertEq(assetsAfter, assetsBefore + assets + ((assets * 5e16) / 1e18));
+    }
+
+    function testDepositHeldToVault_ForcedVaultAndMinShares() public {
+        // Add multiple vaults; force selection to vault2
+        hook.addVault(address(vault1), 100, 50);
+        hook.addVault(address(vault2), 200, 30);
+        address[] memory vaults = new address[](2);
+        vaults[0] = address(vault1);
+        vaults[1] = address(vault2);
+        hook.addVaultsToPool(poolId, vaults);
+
+        // Prefund hook with token0 directly
+        uint256 depositAssets = 2e18;
+        token0.mint(address(hook), depositAssets);
+
+        // Expect deposit succeeds with minShares set conservatively (<= ~assets/1.1 due to 10% mock yield)
+        uint256 sharesMin = (depositAssets * 9) / 10;
+        uint256 startShares = ERC20(address(vault2)).balanceOf(address(this));
+        (address usedVault, uint256 assets, uint256 shares) = hook.depositHeldToVault(
+            poolId,
+            address(token0),
+            address(this),
+            sharesMin,
+            address(vault2)
+        );
+
+        assertEq(usedVault, address(vault2));
+        assertEq(assets, depositAssets);
+        assertGe(shares, sharesMin);
+        uint256 endShares = ERC20(address(vault2)).balanceOf(address(this));
+        assertEq(endShares - startShares, shares);
+    }
+
+    function testDepositHeldToVault_NoAssetsRevert() public {
+        // Add a vault and attempt deposit with zero balance
+        hook.addVault(address(vault1), 100, 50);
+        address[] memory vaults = new address[](1);
+        vaults[0] = address(vault1);
+        hook.addVaultsToPool(poolId, vaults);
+
+        vm.expectRevert(bytes("No assets to deposit"));
+        hook.depositHeldToVault(poolId, address(token0), address(this), 0, address(0));
+    }
+
+    function testAfterSwapMintsSharesToReceiverFromHookData() public {
+        // Prepare vault for token0 (assetOut when swapping token1 -> token0)
+        hook.addVault(address(vault1), 100, 50);
+        address[] memory vaults = new address[](1);
+        vaults[0] = address(vault1);
+        hook.addVaultsToPool(poolId, vaults);
+
+        // Share receiver will be this contract; force vault1 to avoid strategy variance
+        address shareReceiver = address(this);
+        bytes memory hookData = abi.encode(shareReceiver, address(vault1), uint256(0));
+
+        uint256 startShares = ERC20(address(vault1)).balanceOf(shareReceiver);
+
+        // Perform swap token1 -> token0 to the hook so the hook can deposit
+        uint256 amountIn = 1e18;
+        swapRouter.swapExactTokensForTokens({
+            amountIn: amountIn,
+            amountOutMin: 0,
+            zeroForOne: false,
+            poolKey: poolKey,
+            hookData: hookData,
+            receiver: address(hook),
+            deadline: block.timestamp + 1
+        });
+
+        // After swap, the hook holds the output tokens; deposit them into the forced vault
+        (address usedVault, uint256 assets, uint256 shares) = hook.depositHeldToVault(
+            poolId,
+            address(token0),
+            shareReceiver,
+            0,
+            address(vault1)
+        );
+        assertEq(usedVault, address(vault1));
+        assertGt(assets, 0);
+        assertGt(shares, 0);
+
+        uint256 endShares = ERC20(address(vault1)).balanceOf(shareReceiver);
+        assertGt(endShares, startShares);
     }
 }
