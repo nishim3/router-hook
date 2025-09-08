@@ -1,29 +1,11 @@
-# Uniswap v4 Hook Template
+# Uniswap v4 Router Hook
 
-**A template for writing Uniswap v4 Hooks 🦄**
+**A hook to route between various ERC4626 Vaults**
 
-### Get Started
-
-This template provides a starting point for writing Uniswap v4 Hooks, including a simple example and preconfigured test environment. Start by creating a new repository using the "Use this template" button at the top right of this page. Alternatively you can also click this link:
-
-[![Use this Template](https://img.shields.io/badge/Use%20this%20Template-101010?style=for-the-badge&logo=github)](https://github.com/uniswapfoundation/v4-template/generate)
-
-<details>
-<summary>Updating to v4-template:latest</summary>
-
-This template is actively maintained -- you can update the v4 dependencies, scripts, and helpers:
-
-```bash
-git remote add template https://github.com/uniswapfoundation/v4-template
-git fetch template
-git merge template/main <BRANCH> --allow-unrelated-histories
-```
-
-</details>
 
 ### Requirements
 
-This template is designed to work with Foundry (stable). If you are using Foundry Nightly, you may encounter compatibility issues. You can update your Foundry installation to the latest stable version by running:
+This implementation is designed to work with Foundry (stable). If you are using Foundry Nightly, you may encounter compatibility issues. You can update your Foundry installation to the latest stable version by running:
 
 ```
 foundryup
