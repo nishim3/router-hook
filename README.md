@@ -15,7 +15,7 @@ To set up the project, run the following commands in your terminal to install de
 
 ```
 forge install
-forge test
+forge test -vvv
 ```
 
 ### Additional Resources
